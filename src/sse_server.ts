@@ -1,12 +1,14 @@
 /**
- * SPDX-FileCopyrightText: © 2025 Talib Kareem <taazkareem@icloud.com>
+ * SPDX-FileCopyrightText: © 2025 Talib Kareem
  * SPDX-License-Identifier: MIT
  *
- * SSE and HTTP Streamable Transport Server
+ * SSE and HTTP Streamable Transport Server (dual-stack)
  *
- * This module provides HTTP Streamable and legacy SSE transport support
- * for the ClickUp MCP Server. It reuses the unified server configuration
- * from server.ts to avoid code duplication.
+ * - Expone /mcp (HTTP streamable) y /sse (legacy SSE) + /health
+ * - Escucha en IPv4/IPv6 según HOST:
+ *      HOST = '::' (por defecto) -> dual-stack
+ *      HOST = '0.0.0.0'          -> solo IPv4
+ * - Pensado para Railway (no fijar PORT; la plataforma lo inyecta).
  */
 
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -16,6 +18,7 @@ import express from 'express';
 import https from 'https';
 import http from 'http';
 import fs from 'fs';
+
 import { server, configureServer } from './server.js';
 import configuration from './config.js';
 import {
@@ -32,10 +35,10 @@ const app = express();
 const logger = new Logger('SSEServer');
 
 export function startSSEServer() {
-  // Configure the unified server first
+  // 1) Config base unificada
   configureServer();
 
-  // Apply security middleware (all are opt-in via environment variables)
+  // 2) Seguridad (opt-in por env)
   logger.info('Configuring security middleware', {
     securityFeatures: configuration.enableSecurityFeatures,
     originValidation: configuration.enableOriginValidation,
@@ -43,33 +46,28 @@ export function startSSEServer() {
     cors: configuration.enableCors
   });
 
-  // Always apply input validation (reasonable defaults)
   app.use(createInputValidationMiddleware());
-
-  // Apply optional security middleware
   app.use(createSecurityLoggingMiddleware());
   app.use(createSecurityHeadersMiddleware());
   app.use(createCorsMiddleware());
   app.use(createOriginValidationMiddleware());
   app.use(createRateLimitMiddleware());
 
-  // Configure JSON parsing with configurable size limit
+  // 3) JSON body (tamaño configurable)
   app.use(express.json({
     limit: configuration.maxRequestSize,
-    verify: (req, res, buf) => {
-      // Additional validation can be added here if needed
-      if (buf.length === 0) {
-        logger.debug('Empty request body received');
-      }
+    verify: (_req, _res, buf) => {
+      if (buf.length === 0) logger.debug('Empty request body received');
     }
   }));
 
+  // 4) Transports en memoria por sesión
   const transports = {
     streamable: {} as Record<string, StreamableHTTPServerTransport>,
     sse: {} as Record<string, SSEServerTransport>,
   };
 
-  // Streamable HTTP endpoint - handles POST requests for client-to-server communication
+  // ========== HTTP Streamable ==========
   app.post('/mcp', async (req, res) => {
     try {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
@@ -79,32 +77,26 @@ export function startSSEServer() {
         contentType: req.headers['content-type'],
         origin: req.headers.origin
       });
+
       let transport: StreamableHTTPServerTransport;
 
       if (sessionId && transports.streamable[sessionId]) {
         transport = transports.streamable[sessionId];
       } else if (!sessionId && isInitializeRequest(req.body)) {
         transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => `session_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`,
-          onsessioninitialized: (sessionId) => {
-            transports.streamable[sessionId] = transport;
-          }
+          sessionIdGenerator: () => `session_${Date.now()}_${Math.random().toString(36).slice(2, 15)}`,
+          onsessioninitialized: (sid) => { transports.streamable[sid] = transport; }
         });
 
         transport.onclose = () => {
-          if (transport.sessionId) {
-            delete transports.streamable[transport.sessionId];
-          }
+          if (transport.sessionId) delete transports.streamable[transport.sessionId];
         };
 
         await server.connect(transport);
       } else {
         res.status(400).json({
           jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: 'Bad Request: No valid session ID provided',
-          },
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
           id: null,
         });
         return;
@@ -116,10 +108,7 @@ export function startSSEServer() {
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: '2.0',
-          error: {
-            code: -32603,
-            message: 'Internal server error',
-          },
+          error: { code: -32603, message: 'Internal server error' },
           id: null,
         });
       }
@@ -132,16 +121,14 @@ export function startSSEServer() {
       res.status(400).send('Invalid or missing session ID');
       return;
     }
-
     const transport = transports.streamable[sessionId];
     await transport.handleRequest(req, res);
   };
 
   app.get('/mcp', handleSessionRequest);
-
   app.delete('/mcp', handleSessionRequest);
 
-  // Legacy SSE endpoints (for backwards compatibility)
+  // ========== Legacy SSE ==========
   app.get('/sse', async (req, res) => {
     const transport = new SSEServerTransport('/messages', res);
     transports.sse[transport.sessionId] = transport;
@@ -152,10 +139,7 @@ export function startSSEServer() {
       userAgent: req.headers['user-agent']
     });
 
-    res.on('close', () => {
-      delete transports.sse[transport.sessionId];
-    });
-
+    res.on('close', () => { delete transports.sse[transport.sessionId]; });
     await server.connect(transport);
   });
 
@@ -169,8 +153,8 @@ export function startSSEServer() {
     }
   });
 
-  // Health check endpoint
-  app.get('/health', (req, res) => {
+  // ========== Health ==========
+  app.get('/health', (_req, res) => {
     res.json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
@@ -184,21 +168,27 @@ export function startSSEServer() {
     });
   });
 
-  // Server creation and startup
-  const PORT = Number(configuration.port ?? '3231');
+  // ========== Startup (dual-stack) ==========
+  const PORT = Number(configuration.port ?? process.env.PORT ?? '3231');
   const HTTPS_PORT = Number(configuration.httpsPort ?? '3443');
 
-  // Function to create and start HTTP server
+  // HOST precedence: config.host > HOST > BIND_HOST > default '::' (dual-stack)
+  const HOST =
+    (configuration as any).host ||
+    process.env.HOST ||
+    process.env.BIND_HOST ||
+    '::';
+
   function startHttpServer() {
     const httpServer = http.createServer(app);
-    httpServer.listen(PORT, '0.0.0.0', () => {
+    httpServer.listen(PORT, HOST, () => {
+      const base = hostToPrintable(HOST);
       logger.info('ClickUp MCP Server (HTTP) started', {
-        port: PORT,
-        protocol: 'http',
+        host: HOST, port: PORT, protocol: 'http',
         endpoints: {
-          streamableHttp: `http://0.0.0.0:${PORT}/mcp`,
-          legacySSE: `http://0.0.0.0:${PORT}/sse`,
-          health: `http://0.0.0.0:${PORT}/health`
+          streamableHttp: `http://${base}:${PORT}/mcp`,
+          legacySSE: `http://${base}:${PORT}/sse`,
+          health: `http://${base}:${PORT}/health`
         },
         security: {
           featuresEnabled: configuration.enableSecurityFeatures,
@@ -208,33 +198,31 @@ export function startSSEServer() {
           httpsEnabled: configuration.enableHttps
         }
       });
-
-      console.log(`✅ ClickUp MCP Server started on http://0.0.0.0:${PORT}`);
-      console.log(`📡 Streamable HTTP endpoint: http://0.0.0.0:${PORT}/mcp`);
-      console.log(`🔄 Legacy SSE endpoint: http://0.0.0.0:${PORT}/sse`);
-      console.log(`❤️  Health check: http://0.0.0.0:${PORT}/health`);
+      console.log(`✅ ClickUp MCP Server started on http://${base}:${PORT}`);
+      console.log(`📡 Streamable HTTP endpoint: http://${base}:${PORT}/mcp`);
+      console.log(`🔄 Legacy SSE endpoint: http://${base}:${PORT}/sse`);
+      console.log(`❤️  Health check: http://${base}:${PORT}/health`);
 
       if (configuration.enableHttps) {
-        console.log(`⚠️  HTTP server running alongside HTTPS - consider disabling HTTP in production`);
+        console.log('⚠️  HTTP server running alongside HTTPS - consider disabling HTTP in production');
       }
     });
     return httpServer;
   }
 
-  // Function to create and start HTTPS server
   function startHttpsServer() {
+    if (!configuration.enableHttps) return null;
+
     if (!configuration.sslKeyPath || !configuration.sslCertPath) {
       logger.error('HTTPS enabled but SSL certificate paths not provided', {
         sslKeyPath: configuration.sslKeyPath,
         sslCertPath: configuration.sslCertPath
       });
-      console.log(`❌ HTTPS enabled but SSL_KEY_PATH and SSL_CERT_PATH not provided`);
-      console.log(`   Set SSL_KEY_PATH and SSL_CERT_PATH environment variables`);
+      console.log('❌ HTTPS enabled but SSL_KEY_PATH and SSL_CERT_PATH not provided');
       return null;
     }
 
     try {
-      // Check if certificate files exist
       if (!fs.existsSync(configuration.sslKeyPath)) {
         throw new Error(`SSL key file not found: ${configuration.sslKeyPath}`);
       }
@@ -244,23 +232,21 @@ export function startSSEServer() {
 
       const httpsOptions: https.ServerOptions = {
         key: fs.readFileSync(configuration.sslKeyPath),
-        cert: fs.readFileSync(configuration.sslCertPath)
+        cert: fs.readFileSync(configuration.sslCertPath),
+        ca: configuration.sslCaPath && fs.existsSync(configuration.sslCaPath)
+          ? fs.readFileSync(configuration.sslCaPath)
+          : undefined,
       };
 
-      // Add CA certificate if provided
-      if (configuration.sslCaPath && fs.existsSync(configuration.sslCaPath)) {
-        httpsOptions.ca = fs.readFileSync(configuration.sslCaPath);
-      }
-
       const httpsServer = https.createServer(httpsOptions, app);
-      httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
+      httpsServer.listen(HTTPS_PORT, HOST, () => {
+        const base = hostToPrintable(HOST);
         logger.info('ClickUp MCP Server (HTTPS) started', {
-          port: HTTPS_PORT,
-          protocol: 'https',
+          host: HOST, port: HTTPS_PORT, protocol: 'https',
           endpoints: {
-            streamableHttp: `https://0.0.0.0:${HTTPS_PORT}/mcp`,
-            legacySSE: `https://0.0.0.0:${HTTPS_PORT}/sse`,
-            health: `https://0.0.0.0:${HTTPS_PORT}/health`
+            streamableHttp: `https://${base}:${HTTPS_PORT}/mcp`,
+            legacySSE: `https://${base}:${HTTPS_PORT}/sse`,
+            health: `https://${base}:${HTTPS_PORT}/health`
           },
           security: {
             featuresEnabled: configuration.enableSecurityFeatures,
@@ -270,48 +256,43 @@ export function startSSEServer() {
             httpsEnabled: true
           }
         });
-
-        console.log(`🔒 ClickUp MCP Server (HTTPS) started on https://0.0.0.0:${HTTPS_PORT}`);
-        console.log(`📡 Streamable HTTPS endpoint: https://0.0.0.0:${HTTPS_PORT}/mcp`);
-        console.log(`🔄 Legacy SSE HTTPS endpoint: https://0.0.0.0:${HTTPS_PORT}/sse`);
-        console.log(`❤️  Health check HTTPS: https://0.0.0.0:${HTTPS_PORT}/health`);
+        console.log(`🔒 ClickUp MCP Server (HTTPS) started on https://${base}:${HTTPS_PORT}`);
+        console.log(`📡 Streamable HTTPS endpoint: https://${base}:${HTTPS_PORT}/mcp`);
+        console.log(`🔄 Legacy SSE HTTPS endpoint: https://${base}:${HTTPS_PORT}/sse`);
+        console.log(`❤️  Health check HTTPS: https://${base}:${HTTPS_PORT}/health`);
       });
       return httpsServer;
-    } catch (error) {
+    } catch (_e) {
       logger.error('Failed to start HTTPS server', {
         error: 'An error occurred while starting HTTPS server.',
         sslKeyPath: 'REDACTED',
         sslCertPath: 'REDACTED'
       });
-      console.log(`❌ Failed to start HTTPS server. Please check the server configuration and logs for details.`);
+      console.log('❌ Failed to start HTTPS server. Please check the server configuration and logs for details.');
       return null;
     }
   }
 
-  // Start servers based on configuration
-  const servers: (http.Server | https.Server)[] = [];
-
-  // Always start HTTP server (for backwards compatibility)
+  const servers: (http.Server | https.Server | null)[] = [];
   servers.push(startHttpServer());
+  const httpsSrv = startHttpsServer();
+  if (httpsSrv) servers.push(httpsSrv);
 
-  // Start HTTPS server if enabled
-  if (configuration.enableHttps) {
-    const httpsServer = startHttpsServer();
-    if (httpsServer) {
-      servers.push(httpsServer);
-    }
-  }
-
-  // Security status logging
-  if (configuration.enableSecurityFeatures) {
-    console.log(`🔒 Security features enabled`);
-  } else {
-    console.log(`⚠️  Security features disabled (set ENABLE_SECURITY_FEATURES=true to enable)`);
-  }
-
+  // Estado de seguridad en logs
+  console.log(configuration.enableSecurityFeatures
+    ? '🔒 Security features enabled'
+    : '⚠️  Security features disabled (set ENABLE_SECURITY_FEATURES=true to enable)');
   if (!configuration.enableHttps) {
-    console.log(`⚠️  HTTPS disabled (set ENABLE_HTTPS=true with SSL certificates to enable)`);
+    console.log('⚠️  HTTPS disabled (set ENABLE_HTTPS=true with SSL certificates to enable)');
   }
 
-  return servers;
+  return servers.filter(Boolean) as (http.Server | https.Server)[];
+}
+
+/** Muestra host bonito en logs (maneja :: y 0.0.0.0 con corchetes IPv6) */
+function hostToPrintable(host: string) {
+  if (!host) return '0.0.0.0';
+  // Si es IPv6 literal o '::', usa [host]
+  if (host.includes(':')) return `[${host}]`;
+  return host;
 }
